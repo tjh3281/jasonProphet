@@ -1,8 +1,11 @@
 """
-Rewatt x TimesFM Demo
+Rewatt x Prophet Demo
 =====================
 Forecasts tomorrow's hourly occupancy for "Lecture Hall B" from four weeks of
 synthetic timetable history, then derives the optimal AC-shutdown trigger.
+
+Prophet understands day-of-week patterns natively, so Monday morning peaks,
+Friday light loads, and empty weekends are all learnt automatically.
 
 HOW TO RUN (VS Code)
 --------------------
@@ -13,14 +16,12 @@ HOW TO RUN (VS Code)
 2. Install dependencies:
      pip install -r requirements.txt
 3. Open this file in VS Code. Each `# %%` block is a cell.
-   Click "Run Cell" above each block, or hit Shift+Enter to run cell-by-cell
-   in the Interactive Window. First run downloads ~2 GB of TimesFM weights
-   from HuggingFace (only once). On CPU, inference takes ~30-60 s.
+   Click "Run Cell" above each block, or hit Shift+Enter to run cell-by-cell.
 
 WHAT YOU GET
 ------------
 - history.png  : four weeks of synthetic lecture-hall occupancy
-- forecast.png : the money shot - history + TimesFM forecast + shutdown marker
+- forecast.png : history + Prophet forecast + shutdown marker
 - Printed line you can read out during the pitch:
     "ACTION: Schedule AC shutdown at HH:MM on <Weekday>"
 """
@@ -33,6 +34,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
+from prophet import Prophet
 
 np.random.seed(42)
 plt.rcParams["figure.dpi"] = 110
@@ -44,9 +46,7 @@ plt.rcParams["figure.dpi"] = 110
 # Lecture Hall B, capacity 120. A weekday-specific timetable (a real
 # WEEKLY pattern). DAYS=28 means the loop walks four calendar weeks, so
 # weeks 2-4 automatically replay week 1's schedule with fresh small
-# random noise - i.e. the later weeks are "faked" from week 1.
-# Four weekly repetitions give TimesFM enough to learn the pattern.
-# Weekends are empty; that's the AC-shutdown opportunity.
+# random noise. Weekends are empty; that's the AC-shutdown opportunity.
 
 # %%
 START = datetime(2026, 4, 22, 0, 0)   # a Wednesday -> 28 days later
@@ -57,10 +57,7 @@ HOURS = DAYS * 24
 CAPACITY = 120
 
 # (weekday, hour_start, hour_end, occupancy_fraction)
-# weekday: 0=Mon ... 4=Fri. This same weekly pattern repeats every week.
-# By design: Mon-Thu have 2 class blocks each, FRIDAY has only 1 (the
-# lightest weekday), and SAT/SUN (weekday 5/6) have NO entries at all ->
-# completely empty (the ambient term below is also weekday-only).
+# weekday: 0=Mon ... 4=Fri. SAT/SUN (5/6) have no entries -> completely empty.
 TIMETABLE = [
     (0,  8, 10, 0.85),  # Mon 08-10  WIA1003
     (0, 14, 16, 0.70),  # Mon 14-16  WIX1002
@@ -83,9 +80,6 @@ for h in range(HOURS):
     for d, hs, he, frac in TIMETABLE:
         if wd == d and hs <= hh < he:
             target = CAPACITY * frac
-            # CLEAN data: small noise (std 1) and NO random no-shows, so
-            # the weekly pattern repeats consistently week to week ->
-            # TimesFM can forecast the peaks close to their true height.
             noise  = np.random.normal(0, 1)
             occ = max(0.0, target + noise)
             break
@@ -117,47 +111,39 @@ plt.show()
 
 
 # %% [markdown]
-# ## 4. Load Google TimesFM 2.0
+# ## 4. Fit Prophet model
 #
-# First run downloads weights from HuggingFace (~2 GB). On CPU,
-# subsequent inferences take ~30-60 s. Switch backend="gpu" if you have CUDA.
+# Prophet requires columns named `ds` (datetime) and `y` (value).
+# weekly_seasonality and daily_seasonality let it learn day-of-week
+# and hour-of-day patterns from the four weeks of history.
 
 # %%
-import timesfm
+prophet_df = df.rename(columns={"timestamp": "ds", "occupancy": "y"})
 
-tfm = timesfm.TimesFm(
-    hparams=timesfm.TimesFmHparams(
-        backend="cpu",            # change to "gpu" if available
-        per_core_batch_size=32,
-        horizon_len=24,           # forecast the next 24 hours
-        context_len=768,          # max context; four weeks = 672 hours fits within
-        num_layers=50,
-        use_positional_embedding=False,
-    ),
-    checkpoint=timesfm.TimesFmCheckpoint(
-        huggingface_repo_id="google/timesfm-2.0-500m-pytorch"
-    ),
+model = Prophet(
+    weekly_seasonality=True,   # learns Mon-Sun pattern
+    daily_seasonality=True,    # learns hour-of-day pattern
+    seasonality_mode="additive",
+    interval_width=0.80,       # 80% confidence band
 )
-print("TimesFM loaded.")
+model.add_country_holidays(country_name="MY")  # Malaysia public holidays
+model.fit(prophet_df)
+print("Prophet model fitted.")
 
 
 # %% [markdown]
 # ## 5. Forecast tomorrow's 24 hours
 
 # %%
-context = df["occupancy"].values[-768:].astype(np.float32)
-forecast_input  = [context]
-frequency_input = [0]              # 0 = high-frequency (hourly)
-
-point_forecast, quantile_forecast = tfm.forecast(
-    forecast_input, freq=frequency_input,
-)
-
-predictions = np.maximum(point_forecast[0], 0)   # clip negatives
-
-# Forecast timestamps continue right after the history ends
-last_ts   = df["timestamp"].iloc[-1]
+last_ts = df["timestamp"].iloc[-1]
 future_ts = [last_ts + timedelta(hours=i + 1) for i in range(24)]
+
+future_df = pd.DataFrame({"ds": future_ts})
+forecast  = model.predict(future_df)
+
+predictions = np.maximum(forecast["yhat"].values, 0)
+pred_lower  = np.maximum(forecast["yhat_lower"].values, 0)
+pred_upper  = np.maximum(forecast["yhat_upper"].values, 0)
 
 print(f"Hour-by-hour forecast for {future_ts[0]:%A, %Y-%m-%d}:")
 for ts, p in zip(future_ts, predictions):
@@ -166,17 +152,14 @@ for ts, p in zip(future_ts, predictions):
 
 
 # %% [markdown]
-# ## 6. Pitch chart - history + forecast + AC-shutdown trigger
+# ## 6. Pitch chart — history + forecast + AC-shutdown trigger
 
 # %%
-# last_ts / future_ts were computed in section 5
-
-# Decide the shutdown trigger: first time we see >=2 consecutive empty hours
 SHUTDOWN_THRESHOLD = 5     # < 5 people = effectively empty
 shutdown_ts = None
 for i in range(len(predictions) - 1):
     if predictions[i] < SHUTDOWN_THRESHOLD and predictions[i + 1] < SHUTDOWN_THRESHOLD:
-        shutdown_ts = future_ts[i] - timedelta(minutes=10)   # fire 10 min early
+        shutdown_ts = future_ts[i] - timedelta(minutes=10)
         break
 
 fig, ax = plt.subplots(figsize=(14, 5))
@@ -188,16 +171,11 @@ ax.plot(recent["timestamp"], recent["occupancy"],
 
 # Forecast line
 ax.plot(future_ts, predictions, color="#e74c3c", lw=2.4,
-        label="TimesFM forecast (next 24 h)")
+        label="Prophet forecast (next 24 h)")
 
-# Confidence band (10th-90th percentile) if available
-if quantile_forecast is not None:
-    q = np.asarray(quantile_forecast[0])
-    if q.ndim == 2 and q.shape[1] >= 9:
-        lo = np.maximum(q[:, 1], 0)
-        hi = np.maximum(q[:, 8], 0)
-        ax.fill_between(future_ts, lo, hi, alpha=0.15,
-                        color="#e74c3c", label="10th-90th percentile")
+# Confidence band (80th percentile)
+ax.fill_between(future_ts, pred_lower, pred_upper,
+                alpha=0.15, color="#e74c3c", label="80% confidence band")
 
 # Shutdown trigger marker
 if shutdown_ts is not None:
@@ -211,7 +189,7 @@ if shutdown_ts is not None:
     )
 
 ax.set_title(
-    f"Rewatt x TimesFM — Occupancy Forecast for {future_ts[0]:%A %Y-%m-%d}, "
+    f"Rewatt x Prophet — Occupancy Forecast for {future_ts[0]:%A %Y-%m-%d}, "
     f"Lecture Hall B",
     fontsize=13, weight="bold")
 ax.set_ylabel("People present")
